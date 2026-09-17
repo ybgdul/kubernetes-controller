@@ -36,7 +36,7 @@ func (r *Runner) Execute(ctx context.Context) (ctrl.Result, error) {
 		if res.Err != nil { 
 			return res.Result, fmt.Errorf("phase %d has failed: %w", i, res.Err)
 		}
-		if res.Done || res.Result.Requeue || res.Result.RequeueAfter > 0 {
+		if res.Done || res.Result.RequeueAfter > 0 {
 			return res.Result, nil
 		}
 	}
