@@ -1,8 +1,8 @@
+// +kubebuilder:object:generate=true
 package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type EphemeralEnvSpec struct {
@@ -29,10 +29,6 @@ type EphemeralEnv struct {
 	Status EphemeralEnvStatus `json:"status,omitempty"`
 }
 
-// DeepCopyObject implements [cacheapi.Object].
-func (e *EphemeralEnv) DeepCopyObject() runtime.Object {
-	panic("unimplemented")
-}
 
 // +kubebuilder:object:root=true
 
@@ -41,3 +37,4 @@ type EphemeralEnvList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []EphemeralEnv `json:"items"`
 }
+
