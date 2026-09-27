@@ -3,18 +3,20 @@ package controller
 import (
 	"context"
 	"fmt"
-	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	applyappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
+	applymetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -24,7 +26,10 @@ import (
 	"operator/status"
 )
 
-const finalizerName = "example.com/ephemeralenv-cleanup"
+const (
+	finalizerName = "opearator/ephemeral-cleanup"
+	fieldManager = "ephemeral-env-operator"
+)
 
 type EphemeralEnvReconiler struct{ 
 	client.Client
@@ -58,102 +63,67 @@ func (r *EphemeralEnvReconiler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	runner := engine.NewRunner()
-	runner.Register(r.reconcileDatabasePhase(ctx, &env))
-	runner.Register(r.reconcileDeploymentPhase(ctx, &env))
+	runner.Register(r.reconcileDeploymentSSA(&env))
 
 	return runner.Execute(ctx)
 }
 
-func (r *EphemeralEnvReconiler) reconcileDatabasePhase(ctx context.Context, env *dev1alpha1.EphemeralEnv) engine.PhaseHandler { 
+func (r *EphemeralEnvReconiler) reconcileDeploymentSSA(env *dev1alpha1.EphemeralEnv) engine.PhaseHandler { 
 	return func(ctx context.Context) engine.PhaseResult { 
-		if !env.Spec.IncludeDatabase {
-			return engine.PhaseResult{}
-		}
-
-		var secret corev1.Secret
-		err := r.Get(ctx, types.NamespacedName{Name: env.Name + "-db-secret", Namespace: env.Namespace}, &secret)
-		if errors.IsNotFound(err) { 
-			newSecret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: env.Name + "-db-secret",
-					Namespace: env.Namespace,
-				},
-				StringData: map[string]string{"password": "supersecretpassword"},
+		deployApply := applyappsv1.Deployment(env.Name, env.Namespace).
+					WithKind("Deployment").
+					WithAPIVersion("apps/v1").
+					WithOwnerReferences(
+						applymetav1.OwnerReference().
+							WithAPIVersion(dev1alpha1.GroupVersion.String()).
+							WithKind("EphemeralEnv").
+							WithName(env.Name).
+							WithUID(env.UID).
+							WithController(true).
+							WithBlockOwnerDeletion(true),
+					).
+					WithSpec(applyappsv1.DeploymentSpec().
+						WithReplicas(env.Spec.Replicas).
+						WithSelector(applymetav1.LabelSelector().
+							WithMatchLabels(map[string]string{"app": env.Name}),
+						).
+						WithTemplate(applycorev1.PodTemplateSpec().
+							WithLabels(map[string]string{"app": env.Name}).
+							WithSpec(applycorev1.PodSpec().
+								WithContainers(applycorev1.Container().
+									WithName("app").
+									WithImage(env.Spec.Image),
+								),
+							),
+						),
+					)
+		err := r.Apply(ctx, deployApply, client.FieldOwner(fieldManager), client.ForceOwnership)
+		if err != nil {
+			return engine.PhaseResult{
+					Err: fmt.Errorf("failed to apply deployment with SSA: %w", err),
 			}
-			if err := r.Create(ctx, newSecret); err != nil { 
-				return engine.PhaseResult{
-					Err: fmt.Errorf("failed to create db secret: %w", err),
+		}
+		
+		var currentDeploy appsv1.Deployment
+		if err := r.Get(ctx, types.NamespacedName{Name: env.Name, Namespace: env.Namespace}, &currentDeploy); err != nil {
+			if currentDeploy.Status.ReadyReplicas == env.Spec.Replicas { 
+				updated := status.SetCondition(&env.Status.Conditions, metav1.Condition{
+					Type: "Ready",
+					Status: metav1.ConditionTrue,
+					Reason: "DeploymentReady",
+					Message: "All replicas are healthy and ready",
+				})
+				if updated { 
+					env.Status.Phase = "Ready"
+					r.Status().Update(ctx, env)
 				}
 			}
-			return engine.PhaseResult{Result: ctrl.Result{RequeueAfter: 2 *time.Second}}
 		}
-		return engine.PhaseResult{}
+		
+		return engine.PhaseResult{Done: true}
 	}
 }
 
-func(r *EphemeralEnvReconiler) reconcileDeploymentPhase(ctx context.Context, env *dev1alpha1.EphemeralEnv) engine.PhaseHandler { 
-	return func(ctx context.Context) engine.PhaseResult {
-		var deploy appsv1.Deployment
-		err := r.Get(ctx, types.NamespacedName{Name: env.Name, Namespace: env.Namespace}, &deploy)
-
-		if errors.IsNotFound(err) {
-			newDeploy := r.buildDeployment(env)
-			if err := r.Create(ctx, newDeploy); err != nil {
-				return engine.PhaseResult{
-					Err: fmt.Errorf("failed to create deployment: %w", err),
-				}
-			}
-		} else if err != nil { 
-			return engine.PhaseResult{ Err: err} 
-		}
-
-		if deploy.Status.ReadyReplicas == env.Spec.Replicas {
-			updated := status.SetCondition(&env.Status.Conditions, metav1.Condition{
-				Type: "Ready",
-				Status: metav1.ConditionTrue,
-				Reason: "DeploymentReady",
-				Message: "All reaplicas are healthy and ready",
-			})
-			if updated { 
-				env.Status.Phase = "Ready"
-				r.Status().Update(ctx, env)
-			}
-		}
-	return engine.PhaseResult{Done: true}
-	}
-}
-
-func(r *EphemeralEnvReconiler) buildDeployment(env *dev1alpha1.EphemeralEnv) *appsv1.Deployment { 
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: env.Name,
-			Namespace: env.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(env, dev1alpha1.GroupVersion.WithKind("EphemeralEnv")),
-			},
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &env.Spec.Replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app" : env.Name},
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"app": env.Name},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:"app",
-							Image: env.Spec.Image,
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func(r *EphemeralEnvReconiler) SetupWithManager(manager ctrl.Manager) error { 
+func (r *EphemeralEnvReconiler) SetupWithManager(manager ctrl.Manager) error { 
 	return ctrl.NewControllerManagedBy(manager).For(&dev1alpha1.EphemeralEnv{}).Owns(&appsv1.Deployment{}).Complete(r)
 }
