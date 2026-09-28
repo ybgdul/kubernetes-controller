@@ -11,6 +11,7 @@ type EphemeralEnvSpec struct {
 	IncludeDatabase bool   `json:"includeDatabase,omitempty"`
 	Branch          string `json:"branch"`
 	Image           string `json:"image"`
+	TTL string `json:"ttl,omitempty"`
 }
 
 type EphemeralEnvStatus struct {

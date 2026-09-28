@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -63,9 +64,51 @@ func (r *EphemeralEnvReconiler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	runner := engine.NewRunner()
+	runner.Register(r.reconcileTTLPhase(&env))
 	runner.Register(r.reconcileDeploymentSSA(&env))
 
 	return runner.Execute(ctx)
+}
+
+func (r *EphemeralEnvReconiler) reconcileTTLPhase(env *dev1alpha1.EphemeralEnv) engine.PhaseHandler { 
+	return func(ctx context.Context) engine.PhaseResult{ 
+		logger := log.FromContext(ctx)
+
+		if env.Spec.TTL == "" { 
+			return engine.PhaseResult{}
+		}
+
+		ttlDuration, err := time.ParseDuration(env.Spec.TTL)
+		if err != nil { 
+			logger.Error(err, "invalid TTL format: ", env.Spec.TTL)
+			return engine.PhaseResult{}
+		}
+
+		creationTime := env.CreationTimestamp.Time
+		expirationTime := creationTime.Add(ttlDuration)
+		now := time.Now()
+
+		if now.After(expirationTime) || now.Equal(expirationTime) {
+			logger.Info("TTL has expired for resource, initiating deletion",
+				"name", env.Name,
+				"created", creationTime,
+				"ttl", env.Spec.TTL,
+			)
+
+			if err := r.Delete(ctx, env); err != nil { 
+				return engine.PhaseResult{Err: fmt.Errorf("failed to delete expired EnvironmentalEnv: %w", err)}
+			}
+
+			return engine.PhaseResult{Done: true}
+		}
+		remaining := expirationTime.Sub(now)
+		logger.Info("Scheduling TTL auto-deletion check", "remaining", remaining.String())
+		return engine.PhaseResult{
+			Result: ctrl.Result{
+				RequeueAfter: remaining,
+			},
+		}
+	}
 }
 
 func (r *EphemeralEnvReconiler) reconcileDeploymentSSA(env *dev1alpha1.EphemeralEnv) engine.PhaseHandler { 
