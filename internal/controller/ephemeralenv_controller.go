@@ -8,6 +8,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,6 +19,7 @@ import (
 	applyappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	applymetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
+	"k8s.io/client-go/tools/record"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -35,6 +37,7 @@ const (
 type EphemeralEnvReconiler struct{ 
 	client.Client
 	Scheme *runtime.Scheme
+	Record record.EventRecorder
 }
 
 func (r *EphemeralEnvReconiler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { 
@@ -52,10 +55,22 @@ func (r *EphemeralEnvReconiler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	handled, err := finalizerManager.HandleDeletion(ctx, &env, func(ctx context.Context) error { 
 		logger.Info("Cleaning up external environment resources", "name", env.Name)
+		r.Record.Event(
+				&env,
+				corev1.EventTypeNormal,
+				"CleanupStarted",
+				"Deleting external resources",
+			)
 		// deletion logic 
 		return nil
 	})
 	if handled || err != nil { 
+		r.Record.Event(
+				&env,
+				corev1.EventTypeWarning,
+				"CleanupFailed",
+				fmt.Sprintf("Failed to delete external resources: %v", err),
+			)
 		return ctrl.Result{}, err
 	}
 
@@ -89,6 +104,12 @@ func (r *EphemeralEnvReconiler) reconcileTTLPhase(env *dev1alpha1.EphemeralEnv) 
 		now := time.Now()
 
 		if now.After(expirationTime) || now.Equal(expirationTime) {
+			r.Record.Event(
+				env,
+				corev1.EventTypeNormal,
+				"TTL expired",
+				fmt.Sprintf("TTL has expired (%s) for resource, initiating deletion", env.Spec.TTL),
+			)
 			logger.Info("TTL has expired for resource, initiating deletion",
 				"name", env.Name,
 				"created", creationTime,
@@ -142,10 +163,22 @@ func (r *EphemeralEnvReconiler) reconcileDeploymentSSA(env *dev1alpha1.Ephemeral
 					)
 		err := r.Apply(ctx, deployApply, client.FieldOwner(fieldManager), client.ForceOwnership)
 		if err != nil {
+			r.Record.Event(
+				env,
+				corev1.EventTypeWarning,
+				"ApplyFailed",
+				fmt.Sprintf("Failed to apply child Deployment via SSA: %v", err),
+			)
 			return engine.PhaseResult{
 					Err: fmt.Errorf("failed to apply deployment with SSA: %w", err),
 			}
 		}
+		r.Record.Event(
+			env,
+			corev1.EventTypeWarning,
+			"DeploymentApplied",
+			fmt.Sprintf("Succesfully applied child Deployment %s/%s with image %s", env.Namespace, env.Name, env.Spec.Image),
+		)
 		
 		var currentDeploy appsv1.Deployment
 		if err := r.Get(ctx, types.NamespacedName{Name: env.Name, Namespace: env.Namespace}, &currentDeploy); err != nil {
