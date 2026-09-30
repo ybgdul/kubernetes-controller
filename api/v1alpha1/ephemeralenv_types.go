@@ -17,6 +17,7 @@ type EphemeralEnvSpec struct {
 type EphemeralEnvStatus struct {
 	Phase      string             `json:"phase,omitempty"`
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	URL string `json:"url,omitempty"`
 }
 
 // +kubebuilder:object:root=true

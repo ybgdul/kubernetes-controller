@@ -200,6 +200,34 @@ func (r *EphemeralEnvReconiler) reconcileDeploymentSSA(env *dev1alpha1.Ephemeral
 	}
 }
 
+func (r *EphemeralEnvReconiler) aggregateStatus(ctx context.Context, env *dev1alpha1.EphemeralEnv) error { 
+	var currentDeploy appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{Name: env.Name, Namespace: env.Namespace}, &currentDeploy)
+
+	isDeployReady := err == nil && currentDeploy.Status.Replicas == env.Spec.Replicas
+
+	if isDeployReady { 
+		status.SetCondition(&env.Status.Conditions, metav1.Condition{
+			Type: "Ready",
+			Status: metav1.ConditionTrue,
+			Reason: "AllWorksReady",
+			Message: "Application pods and networking layers are fully operational",
+		})
+		env.Status.Phase = "Ready"
+		env.Status.URL = fmt.Sprintf("http://%s.preview.internal", env.Name)
+	} else {
+		status.SetCondition(&env.Status.Conditions, metav1.Condition{
+			Type: "Ready",
+			Status: metav1.ConditionFalse,
+			Reason: "WorkloadNotReady",
+			Message: fmt.Sprintf("Waiting for pods to be ready: %d/%d ready", currentDeploy.Status.ReadyReplicas, currentDeploy.Status.Replicas ),
+		})
+		env.Status.Phase = "Provisioning"
+	}
+
+	return r.Status().Update(ctx, env)
+}
+
 func (r *EphemeralEnvReconiler) SetupWithManager(manager ctrl.Manager) error { 
 	return ctrl.NewControllerManagedBy(manager).For(&dev1alpha1.EphemeralEnv{}).Owns(&appsv1.Deployment{}).Complete(r)
 }
